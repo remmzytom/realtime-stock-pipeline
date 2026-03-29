@@ -3,12 +3,13 @@ import time
 from datetime import datetime, timezone
 
 import requests
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
+from confluent_kafka import Producer
+from confluent_kafka.error import KafkaError
 
 from config import (
     ALPHA_VANTAGE_API_KEY,
-    KAFKA_BOOTSTRAP_SERVERS,
+    EVENTHUB_CONNECTION_STRING,
+    EVENTHUB_NAMESPACE,
     KAFKA_TOPIC_RAW,
     STOCK_SYMBOLS,
 )
@@ -58,42 +59,52 @@ def fetch_global_quote(symbol: str) -> dict:
     }
 
 
-def create_kafka_producer() -> KafkaProducer:
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        key_serializer=lambda k: k.encode("utf-8"),
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks="all",
-    )
+def _delivery_report(err, msg) -> None:
+    if err:
+        print(f"Delivery failed for {msg.key()}: {err}")
+    else:
+        print(
+            f"Sent quote  symbol={msg.key().decode()}  "
+            f"topic={msg.topic()}  partition={msg.partition()}  offset={msg.offset()}"
+        )
+
+
+def create_producer() -> Producer:
+    # confluent-kafka has full SASL_SSL support, unlike kafka-python which fails
+    # to negotiate TLS with Azure Event Hubs. Username must be the literal string
+    # "$ConnectionString"; password is the full Event Hubs connection string.
+    return Producer({
+        "bootstrap.servers":       EVENTHUB_NAMESPACE,
+        "security.protocol":       "SASL_SSL",
+        "sasl.mechanism":          "PLAIN",
+        "sasl.username":           "$ConnectionString",
+        "sasl.password":           EVENTHUB_CONNECTION_STRING,
+        "socket.timeout.ms":       30000,
+        "message.timeout.ms":      30000,
+    })
 
 
 def run() -> None:
     if not ALPHA_VANTAGE_API_KEY:
         raise ValueError("ALPHA_VANTAGE_API_KEY is not set. Add it to your .env file.")
+    if not EVENTHUB_CONNECTION_STRING:
+        raise ValueError("EVENTHUB_CONNECTION_STRING is not set. Add it to your .env file.")
 
-    producer = create_kafka_producer()
-    print(
-        f"Producer started. Sending to topic '{KAFKA_TOPIC_RAW}' "
-        f"on '{KAFKA_BOOTSTRAP_SERVERS}'."
-    )
+    producer = create_producer()
+    print(f"Producer started. Sending to topic '{KAFKA_TOPIC_RAW}' on '{EVENTHUB_NAMESPACE}'.")
 
     while True:
         for symbol in STOCK_SYMBOLS:
             try:
                 record = fetch_global_quote(symbol)
-                future = producer.send(
+                producer.produce(
                     topic=KAFKA_TOPIC_RAW,
-                    key=symbol,
-                    value=record,
+                    key=symbol.encode("utf-8"),
+                    value=json.dumps(record).encode("utf-8"),
+                    on_delivery=_delivery_report,
                 )
-                metadata = future.get(timeout=15)
-                print(
-                    "Sent quote",
-                    f"symbol={symbol}",
-                    f"topic={metadata.topic}",
-                    f"partition={metadata.partition}",
-                    f"offset={metadata.offset}",
-                )
+                # Trigger delivery callbacks for any queued messages
+                producer.poll(0)
             except (requests.RequestException, ValueError) as exc:
                 print(f"Failed to fetch/parse quote for {symbol}: {exc}")
             except KafkaError as exc:
